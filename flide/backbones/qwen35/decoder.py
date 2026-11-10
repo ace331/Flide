@@ -111,7 +111,8 @@ class Qwen35(Backbone):
 
             inner = build(arch, cfg, torch.device("meta"), getattr(torch, dtype), lean=lambda name: True)
             model = _Headless(inner) if headless else inner
-            sharded = cls(model, quantize=quantize, tp=tp, defer=True, **options)
+            sharded = cls(model, quantize=quantize, tp=tp, defer=True,
+                         plan_names={id(p): n for n, p in inner.named_parameters()}, **options)
             load_into(inner, model_dir, device, key_map=key_map, skip=skip,
                       plan=sharded.shard_plan, merge=merge_lora)
             sharded.device = torch.device(device)
@@ -145,9 +146,13 @@ class Qwen35(Backbone):
         return cls(model, quantize=quantize, fp8_store=(store, names) if store else None, tp=tp, **options)
 
     def __init__(self, causal_lm, cuda_graphs: bool = False, quantize: str | None = None, fp8_store=None,
-                 tp: tuple[int, int] | None = None, defer: bool = False):
+                 tp: tuple[int, int] | None = None, defer: bool = False,
+                 plan_names: dict[int, str] | None = None):
         """`defer=True`: shard (recording the plan for a later load) and skip everything that
-        needs real weights; the caller runs `finish()` once the shards are read in."""
+        needs real weights; the caller runs `finish()` once the shards are read in.
+        `plan_names` maps a parameter to the name the checkpoint loader walks, so `shard()` can
+        record its plan by name while the parameters it reads are still alive (their ids are
+        recycled the moment they are replaced)."""
         self.causal_lm = causal_lm
         inner = causal_lm.model
         self.vlm = inner if hasattr(inner, "visual") else None
@@ -163,7 +168,8 @@ class Qwen35(Backbone):
         self.fp8 = False
         self.quantize = quantize
         self.fp8_store = fp8_store
-        self.shard_plan: dict[int, tuple[int, Any]] = {}
+        self.shard_plan: dict[str, tuple[int, Any]] = {}
+        self._plan_names = plan_names or {}
         self.tp = tp if tp is not None and tp[1] > 1 else None
         if self.tp is not None:
             self.shard(*self.tp)
@@ -194,8 +200,9 @@ class Qwen35(Backbone):
         and value heads split evenly; Gated DeltaNet keeps whole groups (a key head with its value heads)."""
         from ...runtime.tp import split
 
-        # The plan is keyed by parameter identity: the loader walks state_dict(), which holds the
-        # very same objects, so name prefixes never have to be reconciled between the two.
+        # The plan is keyed by parameter name and recorded here, while the parameters shard() reads
+        # are still alive: replacing one frees it immediately, and CPython reuses that id for the
+        # next tensor it creates, so an id recorded now would later point at a different tensor.
         self.shard_plan = {}
 
         def take(t, idx, dim=0):
@@ -206,7 +213,9 @@ class Qwen35(Backbone):
             return t.narrow(dim, idx.start, idx.stop - idx.start).contiguous()
 
         def keep(param, idx, dim=0):
-            self.shard_plan[id(param)] = (dim, idx)
+            name = self._plan_names.get(id(param))
+            if name is not None:
+                self.shard_plan[name] = (dim, idx)
             return torch.nn.Parameter(take(param.data, idx, dim), requires_grad=False)
 
         def rows(lin, idx):

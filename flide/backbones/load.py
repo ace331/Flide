@@ -122,8 +122,8 @@ def blank(model, device=None, lean=None, fp8: dict | None = None) -> None:
 def load_into(model, model_dir: str, device, key_map: list[tuple[str, str]] | None = None,
               skip: tuple[str, ...] = (), lean=None, fp8: dict | None = None, merge: bool = False,
               plan: dict[int, tuple[int, object]] | None = None) -> dict:
-    """`plan` (tensor parallel): the selection `shard()` applied, keyed by parameter identity, so a
-    shape-only model is materialized with its own shard instead of the full tensors."""
+    """`plan` (tensor parallel): the selection `shard()` applied, keyed by the name this loader
+    walks, so a shape-only model is materialized with its own shard instead of the full tensors."""
     from .. import lora
 
     adapter = lora.load(model_dir, device, merge)
@@ -168,10 +168,6 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan
                 if b is not None:
                     owner[id(b)] = (mod._buffers, bn, False)
     filled, unused, nbytes = set(), [], 0
-    # Resolve the plan by name up front: replacing a meta tensor frees it, and CPython reuses
-    # that id for the next tensor it creates, so an id looked up later could hit another
-    # tensor's shard spec.
-    cut_for = {name: plan[id(t)] for name, t in targets.items() if plan is not None and id(t) in plan}
     for path in checkpoint_files(model_dir):
         with safe_open(str(path), framework="pt", device=str(device)) as f:
             for key in f.keys():
@@ -204,7 +200,7 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan
                     src = (src.float() * f.get_tensor(key + "_scale").float().reshape(-1, 1)).to(t.dtype)
                 if adapter is not None:
                     src = adapter.apply(key, src)
-                cut = cut_for.get(name)
+                cut = None if plan is None else plan.get(name)
                 if cut is not None:
                     src = _cut(src, cut)
                 if getattr(t, "is_meta", False):
