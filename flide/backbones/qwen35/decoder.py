@@ -62,6 +62,37 @@ class _Headless(torch.nn.Module):
         return None
 
 
+def _restore_rope_buffers(model, device) -> None:
+    """Recompute the buffers a shape-only build left on the meta device.
+
+    RoPE frequencies are computed by the module constructor and stored in non-persistent
+    buffers, which `_init_buffers` does not revisit, so a meta build leaves them without
+    values and the first forward produces NaN. Both Qwen3.5 rotary classes expose the static
+    helper their constructor used, so recompute through it.
+    """
+    device = torch.device(device)
+    for mod in model.modules():
+        names = [n for n, b in mod._buffers.items() if b is not None and b.is_meta]
+        if not names:
+            continue
+        config = getattr(mod, "config", None)
+        rope_type = getattr(mod, "rope_type", None)
+        fn = None
+        for attr, expects in (("compute_default_rope_parameters", "default"),
+                              ("compute_axial_rope_parameters", "axial")):
+            if rope_type == expects and hasattr(type(mod), attr):
+                fn = getattr(type(mod), attr)
+                break
+        if config is None or fn is None:
+            raise RuntimeError(f"{type(mod).__name__}: cannot rebuild the meta buffers {names}")
+        inv_freq, scaling = fn(config, device=device)
+        for name in names:
+            value = inv_freq.clone() if "original" in name else inv_freq
+            mod._buffers[name] = value.to(mod._buffers[name].dtype)
+        if hasattr(mod, "attention_scaling"):
+            mod.attention_scaling = scaling
+
+
 class Qwen35(Backbone):
     model_types = ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
     block_attention = True
@@ -115,6 +146,7 @@ class Qwen35(Backbone):
                          plan_names={id(p): n for n, p in inner.named_parameters()}, **options)
             load_into(inner, model_dir, device, key_map=key_map, skip=skip,
                       plan=sharded.shard_plan, merge=merge_lora)
+            _restore_rope_buffers(inner, device)
             sharded.device = torch.device(device)
             sharded.finish()
             return sharded
