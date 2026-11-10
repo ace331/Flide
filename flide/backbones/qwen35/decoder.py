@@ -100,6 +100,23 @@ class Qwen35(Backbone):
         lean_fp8 = quantize == "fp8" and tp is None and not moe
         store = {} if lean_fp8 else None
         lean = _fp8_target if lean_fp8 else None
+        shard_lean = tp is not None and tp[1] > 1 and quantize is None and loader == "direct"
+        if shard_lean:
+            # Build shape-only and cut each rank's shard while reading, instead of building the
+            # full model on every rank and cutting it afterwards. The cut-first order is what
+            # keeps a rank's peak at its own shard: on an A100 80G the build-then-cut order
+            # peaked at ~50 GiB and left 36.5 GiB behind on cards that were not empty, against
+            # 17.8 GiB for a rank that had the whole card (unreturned allocator fragments).
+            from ..load import build, load_into
+
+            inner = build(arch, cfg, torch.device("meta"), getattr(torch, dtype), lean=lambda name: True)
+            model = _Headless(inner) if headless else inner
+            sharded = cls(model, quantize=quantize, tp=tp, defer=True, **options)
+            load_into(inner, model_dir, device, key_map=key_map, skip=skip,
+                      plan=sharded.shard_plan, merge=merge_lora)
+            sharded.device = torch.device(device)
+            sharded.finish()
+            return sharded
         if loader == "none":
             from ..load import blank, build
 
@@ -128,7 +145,9 @@ class Qwen35(Backbone):
         return cls(model, quantize=quantize, fp8_store=(store, names) if store else None, tp=tp, **options)
 
     def __init__(self, causal_lm, cuda_graphs: bool = False, quantize: str | None = None, fp8_store=None,
-                 tp: tuple[int, int] | None = None):
+                 tp: tuple[int, int] | None = None, defer: bool = False):
+        """`defer=True`: shard (recording the plan for a later load) and skip everything that
+        needs real weights; the caller runs `finish()` once the shards are read in."""
         self.causal_lm = causal_lm
         inner = causal_lm.model
         self.vlm = inner if hasattr(inner, "visual") else None
@@ -142,16 +161,24 @@ class Qwen35(Backbone):
         self.cuda_graphs = cuda_graphs
         pin_fla_size_buckets()
         self.fp8 = False
+        self.quantize = quantize
+        self.fp8_store = fp8_store
+        self.shard_plan: dict[int, tuple[int, Any]] = {}
         self.tp = tp if tp is not None and tp[1] > 1 else None
         if self.tp is not None:
             self.shard(*self.tp)
+        if not defer:
+            self.finish()
+
+    def finish(self) -> None:
+        """Everything after the weights exist: fused views, optional FP8, the row-parallel wrappers."""
         self._prepare_fused()
-        if fp8_store is not None:
-            self._fp8_from_store(*fp8_store)
-        elif quantize == "fp8":
+        if self.fp8_store is not None:
+            self._fp8_from_store(*self.fp8_store)
+        elif self.quantize == "fp8":
             self.quantize_fp8()
-        elif quantize is not None:
-            raise ValueError(f"quantize {quantize!r}: only fp8")
+        elif self.quantize is not None:
+            raise ValueError(f"quantize {self.quantize!r}: only fp8")
         if self.tp is not None:
             from ...runtime.tp import RowParallel
 
@@ -167,11 +194,19 @@ class Qwen35(Backbone):
         and value heads split evenly; Gated DeltaNet keeps whole groups (a key head with its value heads)."""
         from ...runtime.tp import split
 
+        # The plan is keyed by parameter identity: the loader walks state_dict(), which holds the
+        # very same objects, so name prefixes never have to be reconciled between the two.
+        self.shard_plan = {}
+
         def take(t, idx, dim=0):
-            return (t.index_select(dim, idx) if isinstance(idx, torch.Tensor)
-                    else t.narrow(dim, idx.start, idx.stop - idx.start)).contiguous()
+            if isinstance(idx, torch.Tensor):
+                # Indices are built on the CPU so the plan stays usable against a meta model
+                # and against checkpoint tensors that live on the device.
+                return t.index_select(dim, idx.to(t.device)).contiguous()
+            return t.narrow(dim, idx.start, idx.stop - idx.start).contiguous()
 
         def keep(param, idx, dim=0):
+            self.shard_plan[id(param)] = (dim, idx)
             return torch.nn.Parameter(take(param.data, idx, dim), requires_grad=False)
 
         def rows(lin, idx):
@@ -197,7 +232,7 @@ class Qwen35(Backbone):
                 kd, vd, nv = m.key_dim, m.value_dim, m.num_v_heads
                 split(m.num_k_heads, rank, size)
                 ks, vs, hs = split(kd, rank, size), split(vd, rank, size), split(nv, rank, size)
-                ar = lambda sl, base=0: torch.arange(sl.start, sl.stop, device=self.device) + base
+                ar = lambda sl, base=0: torch.arange(sl.start, sl.stop, dtype=torch.long) + base
                 qkv = torch.cat([ar(ks), ar(ks, kd), ar(vs, 2 * kd)])
                 rows(m.in_proj_qkv, qkv)
                 m.conv1d.weight = keep(m.conv1d.weight, qkv)

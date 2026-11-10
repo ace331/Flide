@@ -120,14 +120,17 @@ def blank(model, device=None, lean=None, fp8: dict | None = None) -> None:
 
 @torch.inference_mode()
 def load_into(model, model_dir: str, device, key_map: list[tuple[str, str]] | None = None,
-              skip: tuple[str, ...] = (), lean=None, fp8: dict | None = None, merge: bool = False) -> dict:
+              skip: tuple[str, ...] = (), lean=None, fp8: dict | None = None, merge: bool = False,
+              plan: dict[int, tuple[int, object]] | None = None) -> dict:
+    """`plan` (tensor parallel): the selection `shard()` applied, keyed by parameter identity, so a
+    shape-only model is materialized with its own shard instead of the full tensors."""
     from .. import lora
 
     adapter = lora.load(model_dir, device, merge)
     if adapter is None:
-        return _load_into(model, model_dir, device, key_map, skip, lean, fp8, None)
+        return _load_into(model, model_dir, device, key_map, skip, lean, fp8, None, plan)
     try:
-        out = _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter)
+        out = _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan)
         adapter.attach(model)
         adapter.check()
     except (ValueError, FileNotFoundError) as exc:
@@ -136,7 +139,15 @@ def load_into(model, model_dir: str, device, key_map: list[tuple[str, str]] | No
     return out
 
 
-def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter) -> dict:
+def _cut(src, spec):
+    """The shard `shard()` kept: rows/columns by index tensor or by a contiguous range."""
+    dim, idx = spec
+    if isinstance(idx, torch.Tensor):
+        return src.index_select(dim, idx.to(src.device))
+    return src.narrow(dim, idx.start, idx.stop - idx.start)
+
+
+def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan=None) -> dict:
     from safetensors import safe_open
 
     t0 = time.perf_counter()
@@ -157,6 +168,9 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter) -> d
                 if t is None:
                     unused.append(key)
                     continue
+                if plan is not None and getattr(t, "is_meta", False):
+                    # Shape-only parameter: give it real storage at its own (already cut) shape.
+                    t.data = torch.empty(tuple(t.shape), device=device, dtype=t.dtype)
                 if lean is not None and lean(name):
                     src = f.get_tensor(key)
                     if tuple(src.shape) != tuple(t.shape):
@@ -177,6 +191,9 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter) -> d
                     src = (src.float() * f.get_tensor(key + "_scale").float().reshape(-1, 1)).to(t.dtype)
                 if adapter is not None:
                     src = adapter.apply(key, src)
+                cut = None if plan is None else plan.get(id(t))
+                if cut is not None:
+                    src = _cut(src, cut)
                 if tuple(src.shape) != tuple(t.shape):
                     raise ValueError(f"{key}: checkpoint shape {tuple(src.shape)}, model {tuple(t.shape)}")
                 t.data.copy_(src)
