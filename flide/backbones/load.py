@@ -155,6 +155,18 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan
         from ..kernels.fp8 import FP8, quantize_rows
     targets = model.state_dict(keep_vars=True)
     rules = [(re.compile(a), b) for a, b in (key_map or [])]
+    owner: dict[int, tuple[dict, str, bool]] = {}
+    if plan is not None:
+        # A shape-only model needs real storage before the copy; replace the tensor in its
+        # module (a meta Parameter refuses `set_data` to a device tensor) and keep the plan
+        # usable by resolving it through the identity of the tensor as the model holds it now.
+        for mod in model.modules():
+            for pn, p in mod._parameters.items():
+                if p is not None:
+                    owner[id(p)] = (mod._parameters, pn, True)
+            for bn, b in mod._buffers.items():
+                if b is not None:
+                    owner[id(b)] = (mod._buffers, bn, False)
     filled, unused, nbytes = set(), [], 0
     for path in checkpoint_files(model_dir):
         with safe_open(str(path), framework="pt", device=str(device)) as f:
@@ -168,9 +180,6 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan
                 if t is None:
                     unused.append(key)
                     continue
-                if plan is not None and getattr(t, "is_meta", False):
-                    # Shape-only parameter: give it real storage at its own (already cut) shape.
-                    t.data = torch.empty(tuple(t.shape), device=device, dtype=t.dtype)
                 if lean is not None and lean(name):
                     src = f.get_tensor(key)
                     if tuple(src.shape) != tuple(t.shape):
@@ -194,6 +203,11 @@ def _load_into(model, model_dir, device, key_map, skip, lean, fp8, adapter, plan
                 cut = None if plan is None else plan.get(id(t))
                 if cut is not None:
                     src = _cut(src, cut)
+                if getattr(t, "is_meta", False):
+                    container, attr, is_param = owner[id(t)]
+                    real = torch.empty(tuple(t.shape), device=device, dtype=t.dtype)
+                    container[attr] = (torch.nn.Parameter(real, requires_grad=False) if is_param else real)
+                    targets[name] = t = real
                 if tuple(src.shape) != tuple(t.shape):
                     raise ValueError(f"{key}: checkpoint shape {tuple(src.shape)}, model {tuple(t.shape)}")
                 t.data.copy_(src)
