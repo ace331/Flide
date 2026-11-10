@@ -85,10 +85,12 @@ def _restore_rope_buffers(model, device) -> None:
                 break
         if config is None or fn is None:
             raise RuntimeError(f"{type(mod).__name__}: cannot rebuild the meta buffers {names}")
-        inv_freq, scaling = fn(config, device=device)
+        # Compute on the CPU like the constructor does (it passes no device) and move afterwards:
+        # computing on the device rounds the frequencies differently.
+        inv_freq, scaling = fn(config)
         for name in names:
             value = inv_freq.clone() if "original" in name else inv_freq
-            mod._buffers[name] = value.to(mod._buffers[name].dtype)
+            mod._buffers[name] = value.to(device=device, dtype=mod._buffers[name].dtype)
         if hasattr(mod, "attention_scaling"):
             mod.attention_scaling = scaling
 
